@@ -1,0 +1,239 @@
+\documentclass[conference]{IEEEtran}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazil]{babel}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage{listings}
+
+% ===================================================================
+% INSTRUÇÕES: os trechos marcados com [PREENCHER] dependem dos seus
+% resultados experimentais. Substitua-os após executar o pipeline.
+% ===================================================================
+
+\title{Análise Quantitativa do Trade-off entre Especialização e
+Generalização em LLMs via Fine-Tuning}
+
+\author{\IEEEauthorblockN{[PREENCHER: Seu Nome]}
+\IEEEauthorblockA{Instituto de Computação -- Universidade Federal do Amazonas\\
+[PREENCHER: seu e-mail]}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Este trabalho avalia empiricamente o trade-off entre especialização e
+generalização no fine-tuning de Modelos de Linguagem de Grande Porte.
+Um modelo Qwen2.5-3B-Instruct foi especializado para a tarefa de
+Text-to-SQL via QLoRA sobre o training split do benchmark Spider, em
+duas configurações de hiperparâmetros, e avaliado com uma métrica
+customizada de Execution Accuracy implementada em DeepEval. A regressão
+de capacidade geral foi medida em uma suíte de 150 questões do MMLU
+(5-shot) cobrindo STEM, Humanidades e Ciências Sociais. Os resultados
+mostram um ganho de [PREENCHER] pontos percentuais na tarefa-alvo,
+acompanhado de uma variação de [PREENCHER]\% na acurácia agregada do
+MMLU, com efeitos heterogêneos entre categorias.
+\end{abstract}
+
+\section{Introdução}
+A especialização de LLMs via fine-tuning é amplamente empregada para
+otimizar o desempenho em domínios específicos, mas pode comprometer a
+robustez do modelo fora do domínio de treinamento --- fenômeno conhecido
+como esquecimento catastrófico ou regressão de capacidade. Este trabalho
+projeta e executa um pipeline experimental que mede com precisão ambas
+as facetas do fenômeno: o ganho de especialização em Text-to-SQL e a
+perda de generalização em conhecimento geral.
+
+\section{Metodologia}
+
+\subsection{Modelo e infraestrutura}
+Utilizamos o modelo \texttt{Qwen/Qwen2.5-3B-Instruct} como base. Todos
+os experimentos foram executados em [PREENCHER: GPU utilizada, e.g.,
+NVIDIA T4 com 16 GB de VRAM, Google Colab tier gratuito].
+
+\subsection{Pipeline de dados}
+O training split do Spider (7.000 exemplos) foi convertido para o
+formato de chat com três turnos: uma mensagem de sistema fixa instruindo
+a geração de SQL em bloco markdown, uma mensagem de usuário contendo a
+serialização textual do esquema do banco-alvo seguida da pergunta em
+linguagem natural, e a resposta de referência como turno do assistente.
+A serialização do esquema lista, para cada tabela, suas colunas com
+tipos, seguidas das chaves primárias e estrangeiras, suprindo a
+informação necessária ao \emph{schema linking}. O dev split (1.034
+exemplos) foi reservado exclusivamente para avaliação.
+
+\subsection{Métrica de Execution Accuracy}
+A métrica foi implementada como uma classe que herda de
+\texttt{deepeval.metrics.BaseMetric}, com a lógica de avaliação no
+método \texttt{measure}. O fluxo é: (i) extração robusta da consulta a
+partir da saída bruta do modelo, priorizando blocos \texttt{```sql} e
+recorrendo à primeira instrução \texttt{SELECT} no texto; (ii) conexão
+somente-leitura ao banco SQLite correspondente ao \texttt{db\_id} do
+caso de teste; (iii) execução da consulta gerada e da consulta gold sob
+\texttt{try-except}, tratando erros de sintaxe como falha; (iv)
+comparação dos conjuntos de resultados como multiconjuntos (insensível à
+ordem das linhas), exceto quando a consulta gold contém
+\texttt{ORDER BY}, caso em que a comparação preserva a ordem, seguindo a
+semântica do avaliador oficial do Spider; (v) retorno de 1.0 para
+resultados idênticos e 0.0 caso contrário. Esta métrica única foi
+aplicada de forma idêntica ao baseline e aos modelos fine-tuned,
+integrada a um teste \texttt{pytest} que consolida a acurácia agregada e
+persiste o resultado por exemplo.
+
+\subsection{Baseline}
+O baseline foi obtido submetendo o modelo base ao dev split com um
+prompt few-shot fixo contendo 3 exemplos (esquema + pergunta + SQL)
+amostrados do training split com seed 42. Toda a decodificação de
+avaliação foi determinística (greedy, \texttt{do\_sample=False}).
+
+\subsection{Fine-tuning}
+O fine-tuning empregou QLoRA: o modelo base quantizado em 4 bits (NF4,
+double quantization, computação em bfloat16) com adaptadores LoRA. A
+Tabela~\ref{tab:lora} documenta a configuração. Foram treinadas duas
+configurações que diferem apenas na taxa de aprendizado, em uma ordem de
+grandeza, para observar o impacto deste hiperparâmetro no trade-off.
+
+\begin{table}[ht]
+\centering
+\caption{Configuração do LoRA e hiperparâmetros de treinamento.}
+\label{tab:lora}
+\begin{tabular}{lcc}
+\toprule
+Hiperparâmetro & Config.\ A & Config.\ B \\
+\midrule
+Rank ($r$) & 16 & 16 \\
+Alpha & 32 & 32 \\
+Dropout & 0.05 & 0.05 \\
+Módulos alvo & \multicolumn{2}{c}{q,k,v,o,gate,up,down\_proj} \\
+Taxa de aprendizado & $2\times10^{-4}$ & $2\times10^{-5}$ \\
+Épocas & 2 & 2 \\
+Batch efetivo & 16 & 16 \\
+Comprimento máximo & 2048 & 2048 \\
+Scheduler & cosine & cosine \\
+Otimizador & \multicolumn{2}{c}{paged\_adamw\_8bit} \\
+Seed & 42 & 42 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Avaliação de generalização (MMLU)}
+A suíte de avaliação contém exatamente 150 questões: 50 de
+\texttt{college\_computer\_science} (STEM), 50 de \texttt{philosophy}
+(Humanidades) e 50 de \texttt{high\_school\_macroeconomics} (Ciências
+Sociais), amostradas do test split com seed 42. A avaliação é 5-shot,
+usando os 5 exemplos do dev split de cada disciplina como contexto
+idêntico para o modelo base e os fine-tuned. A resposta é determinada
+pela comparação dos logits dos tokens A--D na posição de resposta,
+procedimento determinístico.
+
+\section{Resultados}
+
+\subsection{Tarefa-alvo (Spider)}
+
+\begin{table}[ht]
+\centering
+\caption{Execution Accuracy no Spider dev split.}
+\label{tab:spider}
+\begin{tabular}{lc}
+\toprule
+Modelo & Execution Accuracy \\
+\midrule
+Baseline (few-shot) & [PREENCHER] \\
+Fine-tuned A ($lr=2\times10^{-4}$) & [PREENCHER] \\
+Fine-tuned B ($lr=2\times10^{-5}$) & [PREENCHER] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+[PREENCHER: 1--2 parágrafos descrevendo os números da
+Tabela~\ref{tab:spider}: magnitude do ganho, diferença entre as duas
+configurações.]
+
+\subsection{Análise de erros}
+[PREENCHER: examine 2--3 exemplos do arquivo
+\texttt{results/eval\_predictions\_lora\_*.json} em que o modelo
+fine-tuned falhou. Categorias típicas a procurar: erro de schema linking
+(coluna/tabela inexistente), JOIN incorreto ou ausente, agregação errada
+(COUNT vs.\ SUM), condição de filtro com valor literal errado. Mostre a
+pergunta, a SQL gerada e a SQL gold de cada caso.]
+
+\subsection{Regressão de capacidade (MMLU)}
+
+\begin{table}[ht]
+\centering
+\caption{Acurácia 5-shot no MMLU (150 questões) e variação percentual em
+relação ao baseline.}
+\label{tab:mmlu}
+\begin{tabular}{lccc}
+\toprule
+Categoria & Base & FT-A ($\Delta\%$) & FT-B ($\Delta\%$) \\
+\midrule
+STEM & [..] & [..] ([..]) & [..] ([..]) \\
+Humanidades & [..] & [..] ([..]) & [..] ([..]) \\
+C.\ Sociais & [..] & [..] ([..]) & [..] ([..]) \\
+\midrule
+Agregado & [..] & [..] ([..]) & [..] ([..]) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+[PREENCHER: parágrafo descrevendo a variação agregada e se a regressão
+foi heterogênea entre categorias.]
+
+\section{Discussão}
+
+\subsection{O ganho justifica a perda?}
+[PREENCHER conforme os números: compare a magnitude do ganho em
+Execution Accuracy com a magnitude da perda no MMLU. Argumente em termos
+do caso de uso: para um sistema dedicado a NL2SQL, perda moderada de
+conhecimento geral tende a ser aceitável; para um assistente de
+propósito geral, não.]
+
+\subsection{Fatores que influenciam o trade-off}
+[PREENCHER: relacione a diferença entre as configurações A e B. Hipótese
+esperada: taxa de aprendizado maior tende a produzir maior ganho na
+tarefa-alvo e maior regressão no MMLU; LoRA, por congelar os pesos base
+e treinar apenas adaptadores de baixo rank, tende a mitigar o
+esquecimento em comparação ao full fine-tuning. Discuta também o papel
+do número de épocas e do rank.]
+
+\subsection{Implicações práticas}
+[PREENCHER: implicações para LLMs comerciais especializados ---
+e.g., manutenção de suítes de regressão de capacidade como parte do
+ciclo de release, uso de adaptadores intercambiáveis sobre um modelo
+base congelado, mistura de dados gerais no conjunto de fine-tuning
+(replay) para mitigar esquecimento.]
+
+\subsection{Contaminação de dados}
+Tanto o Spider quanto o MMLU são benchmarks públicos anteriores ao corte
+de treinamento do modelo base, de modo que é plausível que parte de seus
+exemplos tenha sido vista durante o pré-treino. Isso afeta a
+interpretação em dois sentidos: o baseline no Spider pode estar inflado
+(reduzindo o ganho aparente do fine-tuning) e a acurácia no MMLU pode
+refletir memorização em vez de capacidade, o que tornaria a regressão
+medida um limite inferior do esquecimento real. Como as comparações são
+sempre relativas entre o mesmo modelo antes e depois do fine-tuning, sob
+prompts e decodificação idênticos, as conclusões sobre a direção do
+trade-off permanecem válidas, ainda que as magnitudes absolutas devam
+ser lidas com cautela.
+
+\section{Conclusão}
+[PREENCHER: 1 parágrafo resumindo os achados quantitativos e a resposta
+à pergunta central do trabalho.]
+
+\begin{thebibliography}{9}
+\bibitem{spider} T. Yu et al., ``Spider: A Large-Scale Human-Labeled
+Dataset for Complex and Cross-Domain Semantic Parsing and Text-to-SQL
+Task,'' EMNLP, 2018.
+\bibitem{mmlu} D. Hendrycks et al., ``Measuring Massive Multitask
+Language Understanding,'' ICLR, 2021.
+\bibitem{lora} E. Hu et al., ``LoRA: Low-Rank Adaptation of Large
+Language Models,'' ICLR, 2022.
+\bibitem{qlora} T. Dettmers et al., ``QLoRA: Efficient Finetuning of
+Quantized LLMs,'' NeurIPS, 2023.
+\bibitem{qwen} Qwen Team, ``Qwen2.5 Technical Report,'' arXiv:2412.15115,
+2024.
+\end{thebibliography}
+
+\end{document}

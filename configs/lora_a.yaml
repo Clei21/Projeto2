@@ -1,0 +1,16 @@
+# Configuração A: taxa de aprendizado padrão recomendada para QLoRA
+model_name: Qwen/Qwen2.5-3B-Instruct
+train_file: data/train.jsonl
+output_dir: outputs/lora_a
+
+use_4bit: true
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+learning_rate: 2.0e-4
+num_train_epochs: 2
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+max_seq_length: 2048

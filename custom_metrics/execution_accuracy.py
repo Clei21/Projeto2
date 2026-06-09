@@ -1,67 +1,119 @@
+"""Métrica customizada de Execution Accuracy para a tarefa Text-to-SQL (Spider).
+
+A comparação segue a semântica do avaliador oficial do Spider: os conjuntos
+de resultados são comparados de forma insensível à ordem das linhas, exceto
+quando a consulta de referência contém ORDER BY.
+"""
+
 import re
 import sqlite3
+from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
 
-try:
-    from deepeval.metrics import BaseMetric
-except Exception:
-    class BaseMetric:
-        pass
+from deepeval.metrics import BaseMetric
+from deepeval.test_case import LLMTestCase
+
+_SQL_BLOCK = re.compile(r"```(?:sql)?\s*(.+?)```", re.DOTALL | re.IGNORECASE)
+_SELECT_STMT = re.compile(r"\b(SELECT\b.+?)(?:;|$)", re.DOTALL | re.IGNORECASE)
+_ORDER_BY = re.compile(r"\bORDER\s+BY\b", re.IGNORECASE)
 
 
-def extract_sql(text: str) -> str:
-    if not text:
+def extract_sql(raw_output: str) -> str:
+    """Extrai a consulta SQL da saída bruta do modelo.
+
+    Prioriza blocos markdown ```sql ...```; na ausência deles, captura a
+    primeira instrução SELECT encontrada no texto.
+    """
+    block = _SQL_BLOCK.search(raw_output)
+    candidate = block.group(1) if block else raw_output
+
+    stmt = _SELECT_STMT.search(candidate)
+    if stmt is None:
         return ""
-    block = re.search(r"```(?:sql)?\s*(.*?)```", text, flags=re.I | re.S)
-    sql = block.group(1) if block else text
-    sql = re.sub(r"(?is)^.*?(select|with)\b", r"\1", sql.strip())
-    sql = sql.strip().strip("` ")
-    if ";" in sql:
-        sql = sql.split(";")[0] + ";"
-    return sql
+
+    sql = stmt.group(1).strip()
+    return re.sub(r"\s+", " ", sql)
 
 
-def normalize_rows(rows: Iterable[tuple], ordered: bool) -> Any:
-    normalized = [tuple(str(v).strip() if v is not None else "NULL" for v in row) for row in rows]
-    return normalized if ordered else sorted(normalized)
+def _normalize_row(row) -> tuple:
+    return tuple(
+        round(v, 6) if isinstance(v, float) else v
+        for v in row
+    )
 
 
-class ExecutionAccuracy(BaseMetric):
-    def __init__(self, database_path: str | Path | None = None, timeout: int = 10):
-        self.database_path = str(database_path) if database_path else None
-        self.timeout = timeout
+class ExecutionAccuracyMetric(BaseMetric):
+    """Avalia se a consulta gerada produz o mesmo resultado da consulta gold.
+
+    Cada LLMTestCase deve carregar o identificador do banco em
+    ``additional_metadata={"db_id": ...}``. O atributo ``db_root`` aponta
+    para o diretório ``database/`` do Spider, que contém um subdiretório
+    por banco com o arquivo SQLite correspondente.
+    """
+
+    def __init__(self, db_root: str, threshold: float = 1.0, timeout_s: float = 30.0):
+        self.db_root = Path(db_root)
+        self.threshold = threshold
+        self.timeout_s = timeout_s
         self.score = 0.0
         self.reason = ""
-        self.name = "Execution Accuracy"
+        self.success = False
 
-    def measure(self, test_case) -> float:
-        db_path = getattr(test_case, "context", None) or self.database_path
-        if isinstance(db_path, list):
-            db_path = db_path[0] if db_path else self.database_path
-        if not db_path:
-            self.reason = "Database path not provided"
-            self.score = 0.0
-            return self.score
+    @property
+    def __name__(self):
+        return "Execution Accuracy"
 
-        predicted_sql = extract_sql(getattr(test_case, "actual_output", ""))
-        gold_sql = extract_sql(getattr(test_case, "expected_output", ""))
-        ordered = "order by" in gold_sql.lower()
+    def measure(self, test_case: LLMTestCase) -> float:
+        db_id = (test_case.additional_metadata or {}).get("db_id")
+        if not db_id:
+            return self._fail("test case sem db_id em additional_metadata")
 
+        db_path = self.db_root / db_id / f"{db_id}.sqlite"
+        if not db_path.exists():
+            return self._fail(f"banco não encontrado: {db_path}")
+
+        predicted_sql = extract_sql(test_case.actual_output or "")
+        if not predicted_sql:
+            return self._fail("nenhuma consulta SELECT encontrada na saída do modelo")
+
+        gold_sql = test_case.expected_output
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=self.timeout_s)
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
         try:
-            with sqlite3.connect(str(db_path), timeout=self.timeout) as conn:
-                conn.execute("PRAGMA query_only = ON")
-                pred_rows = conn.execute(predicted_sql).fetchall()
+            try:
+                predicted_rows = conn.execute(predicted_sql).fetchall()
+            except sqlite3.Error as e:
+                return self._fail(f"erro ao executar consulta gerada: {e}")
+
+            try:
                 gold_rows = conn.execute(gold_sql).fetchall()
-            self.score = 1.0 if normalize_rows(pred_rows, ordered) == normalize_rows(gold_rows, ordered) else 0.0
-            self.reason = "match" if self.score else "different result sets"
-        except Exception as exc:
-            self.score = 0.0
-            self.reason = f"execution error: {type(exc).__name__}: {exc}"
+            except sqlite3.Error as e:
+                return self._fail(f"erro ao executar consulta gold: {e}")
+        finally:
+            conn.close()
+
+        predicted = [_normalize_row(r) for r in predicted_rows]
+        gold = [_normalize_row(r) for r in gold_rows]
+
+        if _ORDER_BY.search(gold_sql):
+            match = predicted == gold
+        else:
+            match = Counter(predicted) == Counter(gold)
+
+        self.score = 1.0 if match else 0.0
+        self.success = match
+        self.reason = "resultados idênticos" if match else "resultados divergentes"
         return self.score
 
-    async def a_measure(self, test_case) -> float:
+    async def a_measure(self, test_case: LLMTestCase) -> float:
         return self.measure(test_case)
 
     def is_successful(self) -> bool:
-        return self.score == 1.0
+        return self.success
+
+    def _fail(self, reason: str) -> float:
+        self.score = 0.0
+        self.success = False
+        self.reason = reason
+        return self.score

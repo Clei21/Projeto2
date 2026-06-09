@@ -1,30 +1,85 @@
-import argparse
-import zipfile
-from pathlib import Path
-from urllib.request import urlretrieve
+"""Pré-processamento do Spider.
 
-SPIDER_URL = "https://drive.usercontent.google.com/download?id=1iRDVHLr4mX2w9xBXWSpJadg7kXhj8ntn&export=download&confirm=t"
+Gera três artefatos a partir do diretório oficial do dataset:
+  - data/train.jsonl: training split no formato de chat (campo "messages")
+  - data/dev.jsonl: dev split com schema, pergunta e SQL gold
+  - data/few_shot.json: 3 exemplos fixos do training split para o prompt
+
+Uso:
+    python scripts/prepare_spider.py --spider_dir spider --out_dir data
+"""
+
+import argparse
+import json
+import random
+from pathlib import Path
+
+from spider_common import (
+    SEED,
+    SYSTEM_PROMPT,
+    build_user_message,
+    load_schemas,
+    save_jsonl,
+)
+
+
+def to_chat_example(item: dict, schemas: dict) -> dict:
+    schema = schemas[item["db_id"]]
+    return {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_message(schema, item["question"])},
+            {"role": "assistant", "content": f"```sql\n{item['query']}\n```"},
+        ]
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default="data")
+    parser.add_argument("--spider_dir", required=True)
+    parser.add_argument("--out_dir", default="data")
     args = parser.parse_args()
 
-    data_dir = Path(args.data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = data_dir / "spider.zip"
-    out_dir = data_dir / "spider"
+    spider = Path(args.spider_dir)
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
-    if out_dir.exists():
-        print(f"Spider already exists at {out_dir}")
-        return
+    schemas = load_schemas(spider / "tables.json")
 
-    print("Downloading Spider. If Google blocks the download, upload spider.zip manually to data/spider.zip")
-    urlretrieve(SPIDER_URL, zip_path)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(data_dir)
-    print("Done")
+    with open(spider / "train_spider.json", encoding="utf-8") as f:
+        train = json.load(f)
+    with open(spider / "dev.json", encoding="utf-8") as f:
+        dev = json.load(f)
+
+    rng = random.Random(SEED)
+    few_shot_items = rng.sample(train, 3)
+    few_shot = [
+        {
+            "db_id": ex["db_id"],
+            "schema": schemas[ex["db_id"]],
+            "question": ex["question"],
+            "query": ex["query"],
+        }
+        for ex in few_shot_items
+    ]
+    with open(out / "few_shot.json", "w", encoding="utf-8") as f:
+        json.dump(few_shot, f, ensure_ascii=False, indent=2)
+
+    save_jsonl([to_chat_example(ex, schemas) for ex in train], out / "train.jsonl")
+
+    dev_records = [
+        {
+            "db_id": ex["db_id"],
+            "schema": schemas[ex["db_id"]],
+            "question": ex["question"],
+            "gold_sql": ex["query"],
+        }
+        for ex in dev
+    ]
+    save_jsonl(dev_records, out / "dev.jsonl")
+
+    print(f"train: {len(train)} exemplos | dev: {len(dev_records)} exemplos")
+    print(f"few-shot fixo: {[ex['db_id'] for ex in few_shot]}")
 
 
 if __name__ == "__main__":

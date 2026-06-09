@@ -1,91 +1,98 @@
+"""Fine-tuning com QLoRA (Fase 3).
+
+Lê todos os hiperparâmetros de um arquivo YAML, garantindo que cada
+configuração experimental fique documentada e versionada.
+
+Uso:
+    python scripts/train_lora.py --config configs/lora_a.yaml
+"""
+
 import argparse
-from pathlib import Path
 
 import torch
+import yaml
 from datasets import load_dataset
 from peft import LoraConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
-from trl import SFTTrainer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from trl import SFTConfig, SFTTrainer
 
-from utils import load_config, set_seed
+from spider_common import SEED, set_global_seed
+
+
+def load_model_and_tokenizer(model_name: str, use_4bit: bool):
+    quant_config = None
+    if use_4bit:
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=quant_config,
+        torch_dtype=torch.bfloat16 if quant_config is None else None,
+        device_map="auto",
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return model, tokenizer
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--run_name", default="lora_lr2e-4_ep1")
-    parser.add_argument("--learning_rate", type=float, default=None)
-    parser.add_argument("--num_train_epochs", type=float, default=None)
+    parser.add_argument("--config", required=True)
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
-    set_seed(cfg["seed"])
+    with open(args.config, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
 
-    train_cfg = cfg["train"]
-    if args.learning_rate is not None:
-        train_cfg["learning_rate"] = args.learning_rate
-    if args.num_train_epochs is not None:
-        train_cfg["num_train_epochs"] = args.num_train_epochs
+    set_global_seed(SEED)
 
-    out_dir = Path(cfg["output_dir"]) / args.run_name
-    dataset = load_dataset("json", data_files="data/processed/train.jsonl", split="train")
+    model, tokenizer = load_model_and_tokenizer(cfg["model_name"], cfg.get("use_4bit", True))
+    dataset = load_dataset("json", data_files=cfg["train_file"], split="train")
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg["base_model"], trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["base_model"],
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.config.use_cache = False
-
-    peft_config = LoraConfig(
-        r=cfg["lora"]["r"],
-        lora_alpha=cfg["lora"]["alpha"],
-        lora_dropout=cfg["lora"]["dropout"],
-        target_modules=cfg["lora"]["target_modules"],
+    lora_config = LoraConfig(
+        r=cfg["lora_r"],
+        lora_alpha=cfg["lora_alpha"],
+        lora_dropout=cfg["lora_dropout"],
+        target_modules=cfg["target_modules"],
         bias="none",
         task_type="CAUSAL_LM",
     )
 
-    training_args = TrainingArguments(
-        output_dir=str(out_dir),
-        run_name=args.run_name,
-        learning_rate=train_cfg["learning_rate"],
-        num_train_epochs=train_cfg["num_train_epochs"],
-        per_device_train_batch_size=train_cfg["per_device_train_batch_size"],
-        gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
-        warmup_ratio=train_cfg["warmup_ratio"],
-        logging_steps=train_cfg["logging_steps"],
-        save_strategy=train_cfg["save_strategy"],
-        fp16=train_cfg["fp16"],
-        optim=train_cfg["optim"],
+    sft_config = SFTConfig(
+        output_dir=cfg["output_dir"],
+        num_train_epochs=cfg["num_train_epochs"],
+        learning_rate=cfg["learning_rate"],
+        per_device_train_batch_size=cfg["per_device_train_batch_size"],
+        gradient_accumulation_steps=cfg["gradient_accumulation_steps"],
+        max_seq_length=cfg["max_seq_length"],
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+        logging_steps=20,
+        save_strategy="epoch",
+        bf16=True,
+        gradient_checkpointing=True,
+        optim="paged_adamw_8bit",
+        seed=SEED,
         report_to="none",
-        seed=cfg["seed"],
     )
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=cfg["max_seq_length"],
-        peft_config=peft_config,
-        args=training_args,
+        peft_config=lora_config,
+        args=sft_config,
     )
+
     trainer.train()
-    trainer.save_model(str(out_dir))
-    tokenizer.save_pretrained(str(out_dir))
-    print(f"Saved LoRA adapter to {out_dir}")
+    trainer.save_model(cfg["output_dir"])
+    tokenizer.save_pretrained(cfg["output_dir"])
+    print(f"Adaptador LoRA salvo em {cfg['output_dir']}")
 
 
 if __name__ == "__main__":

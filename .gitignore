@@ -1,8 +1,7 @@
+__pycache__/
+*.pyc
+spider/
 data/
 outputs/
-results/*.json
-results/*.jsonl
-results/*.csv
-__pycache__/
-.ipynb_checkpoints/
-*.pyc
+results/
+.pytest_cache/
