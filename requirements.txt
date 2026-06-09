@@ -1,0 +1,13 @@
+torch==2.5.1
+transformers==4.49.0
+trl==0.15.2
+peft==0.14.0
+datasets==3.3.2
+accelerate==1.4.0
+bitsandbytes==0.45.3
+deepeval==3.9.9
+pytest==8.3.5
+pyyaml==6.0.2
+numpy==1.26.4
+sentencepiece==0.2.0
+protobuf==5.29.3

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.deepeval/
+.deepeval_telemetry.txt
+data/spider/
+data/*.jsonl
+adapters/
+results/*.json
+*.sqlite
+.ipynb_checkpoints/
