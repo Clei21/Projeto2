@@ -10,4 +10,4 @@ pytest==8.3.3
 pyyaml==6.0.2
 numpy==1.26.4
 sentencepiece==0.2.0
-protobuf==5.28.3
+protobuf==4.25.5
