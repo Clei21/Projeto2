@@ -1,130 +1,93 @@
 import argparse
 import json
-import os
-import re
+from pathlib import Path
 
+import torch
 from datasets import load_dataset
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from scripts.config import (
-    MMLU_SUBJECTS,
-    MMLU_QUESTIONS_PER_CATEGORY,
-    MMLU_NUM_SHOTS,
-    MAX_NEW_TOKENS_MMLU,
-    RESULTS_DIR,
-    SEED,
-    set_global_seed,
-)
-from scripts.model_utils import load_model, load_tokenizer, generate_batch
-from scripts.spider_utils import chunked
-
+from utils import load_config, set_seed
 
 LETTERS = ["A", "B", "C", "D"]
 
 
-def format_question(item, include_answer: bool) -> str:
+def format_question(item, include_answer=True):
     choices = item["choices"]
-    block = item["question"].strip() + "\n"
-    for letter, choice in zip(LETTERS, choices):
-        block += f"{letter}. {choice}\n"
-    block += "Answer:"
+    text = f"Question: {item['question']}\n"
+    text += "\n".join(f"{LETTERS[i]}. {choice}" for i, choice in enumerate(choices))
+    text += "\nAnswer:"
     if include_answer:
-        block += f" {LETTERS[item['answer']]}"
-    return block
+        text += f" {LETTERS[int(item['answer'])]}"
+    return text
 
 
-def build_mmlu_messages(few_shot_items, question_item):
-    shots = "\n\n".join(format_question(item, True) for item in few_shot_items)
-    target = format_question(question_item, False)
-    user_content = (
-        "The following are multiple choice questions. "
-        "Answer with a single letter (A, B, C or D).\n\n"
-        f"{shots}\n\n{target}"
-    )
-    return [{"role": "user", "content": user_content}]
+def build_prompt(dev_examples, item):
+    shots = "\n\n".join(format_question(ex, include_answer=True) for ex in dev_examples)
+    return f"Answer the multiple choice questions with only A, B, C, or D.\n\n{shots}\n\n{format_question(item, include_answer=False)}"
 
 
-def parse_answer(text: str) -> str:
-    text = text.strip().upper()
-    if text and text[0] in "ABCD":
-        return text[0]
-    match = re.search(r"\b([ABCD])\b", text)
-    return match.group(1) if match else ""
+def parse_answer(text):
+    cleaned = text.strip().upper()
+    for char in cleaned:
+        if char in LETTERS:
+            return char
+    return ""
+
+
+def load_model(base_model, adapter=None):
+    tokenizer = AutoTokenizer.from_pretrained(adapter or base_model, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(base_model, quantization_config=bnb, device_map="auto", trust_remote_code=True)
+    if adapter:
+        model = PeftModel.from_pretrained(model, adapter)
+    model.eval()
+    return model, tokenizer
+
+
+def generate(model, tokenizer, prompt):
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(model.device)
+    with torch.no_grad():
+        output = model.generate(**inputs, max_new_tokens=4, do_sample=False, temperature=0.0, pad_token_id=tokenizer.eos_token_id)
+    return tokenizer.decode(output[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--adapter_path", default=None)
-    parser.add_argument("--run_name", required=True)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--no_4bit", action="store_true")
+    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--adapter", default=None)
+    parser.add_argument("--name", default="baseline")
     args = parser.parse_args()
 
-    set_global_seed(SEED)
+    cfg = load_config(args.config)
+    set_seed(cfg["seed"])
+    model, tokenizer = load_model(cfg["base_model"], args.adapter)
 
-    tokenizer = load_tokenizer()
-    model = load_model(
-        adapter_path=args.adapter_path,
-        load_in_4bit=not args.no_4bit,
-    )
-
-    per_category = {}
-    all_records = []
-
-    for category, subject in MMLU_SUBJECTS.items():
-        dev_split = load_dataset("cais/mmlu", subject, split="dev")
-        test_split = load_dataset("cais/mmlu", subject, split="test")
-
-        few_shot_items = [dev_split[i] for i in range(MMLU_NUM_SHOTS)]
-        questions = [test_split[i] for i in range(MMLU_QUESTIONS_PER_CATEGORY)]
-
-        prompts = [build_mmlu_messages(few_shot_items, q) for q in questions]
-
-        predictions = []
-        for batch in chunked(prompts, args.batch_size):
-            predictions.extend(
-                generate_batch(model, tokenizer, batch, MAX_NEW_TOKENS_MMLU)
-            )
-
+    results = []
+    summary = {}
+    for group, subject in cfg["mmlu"]["categories"].items():
+        dev = load_dataset("cais/mmlu", subject, split="dev")
+        test = load_dataset("cais/mmlu", subject, split="test")
+        shots = [dev[i] for i in range(5)]
+        sample = [test[i] for i in range(cfg["mmlu"]["samples_per_category"])]
         correct = 0
-        for question_item, raw_output in zip(questions, predictions):
-            predicted = parse_answer(raw_output)
-            gold = LETTERS[question_item["answer"]]
-            is_correct = predicted == gold
-            correct += int(is_correct)
-            all_records.append(
-                {
-                    "category": category,
-                    "subject": subject,
-                    "predicted": predicted,
-                    "gold": gold,
-                    "correct": is_correct,
-                }
-            )
+        for item in sample:
+            raw = generate(model, tokenizer, build_prompt(shots, item))
+            pred = parse_answer(raw)
+            gold = LETTERS[int(item["answer"])]
+            ok = pred == gold
+            correct += int(ok)
+            results.append({"category": group, "subject": subject, "question": item["question"], "gold": gold, "pred": pred, "raw": raw, "correct": ok})
+        summary[group] = correct / len(sample)
+        print(group, summary[group])
 
-        per_category[category] = correct / MMLU_QUESTIONS_PER_CATEGORY
-
-    overall = sum(r["correct"] for r in all_records) / len(all_records)
-
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    out_path = os.path.join(RESULTS_DIR, f"mmlu_{args.run_name}.json")
-    with open(out_path, "w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "run_name": args.run_name,
-                "adapter_path": args.adapter_path,
-                "overall_accuracy": overall,
-                "per_category_accuracy": per_category,
-                "records": all_records,
-            },
-            handle,
-            indent=2,
-        )
-
-    print(f"Run: {args.run_name}")
-    print(f"MMLU Overall Accuracy: {overall:.4f}")
-    for category, acc in per_category.items():
-        print(f"  {category}: {acc:.4f}")
-    print(f"Saved detailed results to {out_path}")
+    summary["overall"] = sum(1 for r in results if r["correct"]) / len(results)
+    Path("results").mkdir(exist_ok=True)
+    with open(Path("results") / f"mmlu_{args.name}.json", "w", encoding="utf-8") as f:
+        json.dump({"summary": summary, "rows": results}, f, ensure_ascii=False, indent=2)
+    print(summary)
 
 
 if __name__ == "__main__":
